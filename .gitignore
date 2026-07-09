@@ -1,0 +1,8 @@
+# lemoncheck
+*.html
+!docs/*.html
+lemoncheck-report-*.html
+.DS_Store
+*.log
+/tmp/
+scratchpad/

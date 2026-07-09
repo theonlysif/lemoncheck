@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+#
+# lemoncheck — inspect a used Mac before you buy it.
+# Traffic-light report of the silent deal-breakers, wear metrics, and
+# component checks that turn a "good deal" into a bricked purchase.
+#
+# Usage:
+#   lemoncheck                 # standard scan (no sudo)
+#   lemoncheck --deep          # + MDM/DEP, firmware, full SSD SMART (uses sudo)
+#   lemoncheck --report [file] # also write a self-contained HTML report
+#   lemoncheck --listing "…"   # diff a pasted ad spec against the hardware
+#   lemoncheck --pixels        # run the fullscreen dead-pixel sweep
+#   lemoncheck --manual        # print the guided manual checklist only
+#   lemoncheck --version | --help
+#
+set -uo pipefail
+
+LEMONCHECK_VERSION="0.1.0"
+
+# --- Resolve install dir (symlink-safe) so we can source lib/ ---------------
+_src="${BASH_SOURCE[0]}"
+while [[ -h "$_src" ]]; do
+  _dir="$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)"
+  _src="$(readlink "$_src")"; [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+BIN_DIR="$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)"
+ROOT_DIR="$(cd -P "$BIN_DIR/.." >/dev/null 2>&1 && pwd)"
+LIB_DIR="$ROOT_DIR/lib"
+# Homebrew layout: libexec/lib or share; fall back to sibling lib.
+[[ -d "$LIB_DIR" ]] || LIB_DIR="$BIN_DIR/../libexec/lib"
+[[ -d "$LIB_DIR" ]] || LIB_DIR="$BIN_DIR"
+
+# shellcheck source=/dev/null
+for m in util tier1_dealbreakers tier2_wear tier3_components tier4_extras report; do
+  f="$LIB_DIR/$m.sh"
+  if [[ -f "$f" ]]; then source "$f"; else echo "lemoncheck: missing module $f" >&2; exit 1; fi
+done
+
+usage() {
+  sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# --- Parse args -------------------------------------------------------------
+DEEP=0; DO_REPORT=0; REPORT_PATH=""; PIXELS_ONLY=0; MANUAL_ONLY=0
+LEMON_LISTING="${LEMON_LISTING:-}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --deep) DEEP=1 ;;
+    --report)
+      DO_REPORT=1
+      if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then REPORT_PATH="$2"; shift; fi ;;
+    --listing)
+      LEMON_LISTING="${2:-}"; shift ;;
+    --pixels) PIXELS_ONLY=1 ;;
+    --manual) MANUAL_ONLY=1 ;;
+    -v|--version) echo "lemoncheck $LEMONCHECK_VERSION"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "lemoncheck: unknown option '$1'" >&2; usage; exit 2 ;;
+  esac
+  shift
+done
+
+# --- Environment setup ------------------------------------------------------
+have jq && HAS_JQ=1 || HAS_JQ=0
+detect_arch
+trap cleanup_tmp EXIT
+
+# Standalone modes.
+if [[ "$PIXELS_ONLY" -eq 1 ]]; then run_pixel_test; exit 0; fi
+if [[ "$MANUAL_ONLY" -eq 1 ]]; then run_manual_checklist; exit 0; fi
+
+# --- Re-exec under sudo for --deep so privileged checks work ----------------
+if [[ "$DEEP" -eq 1 && "$(id -u)" -ne 0 ]]; then
+  echo "lemoncheck --deep needs administrator rights for MDM/firmware/SMART checks."
+  echo "Re-running under sudo (you'll be prompted for your password)..."
+  echo
+  # Preserve args; sudo will re-enter this same code path as root.
+  exec sudo --preserve-env=LEMON_LISTING,NO_COLOR "$0" \
+    --deep \
+    $( [[ "$DO_REPORT" -eq 1 ]] && echo "--report ${REPORT_PATH}" ) \
+    $( [[ -n "$LEMON_LISTING" ]] && printf -- '--listing %q' "$LEMON_LISTING" )
+fi
+
+# --- Run --------------------------------------------------------------------
+clear 2>/dev/null || true
+banner
+
+if [[ "$DEEP" -eq 0 ]]; then
+  printf "  %sRunning standard scan. For MDM, firmware & full SSD checks: %slemoncheck --deep%s\n" \
+    "$C_DIM" "$C_BOLD" "$C_RESET"
+fi
+[[ "$HAS_JQ" -eq 0 ]] && printf "  %s(install 'jq' for more precise parsing)%s\n" "$C_DIM" "$C_RESET"
+
+run_tier1
+run_tier2
+run_tier3
+run_tier4
+run_manual_checklist
+print_summary
+
+# --- HTML report ------------------------------------------------------------
+if [[ "$DO_REPORT" -eq 1 ]]; then
+  if [[ -z "$REPORT_PATH" ]]; then
+    REPORT_PATH="$HOME/Desktop/lemoncheck-report-$(date +%Y%m%d-%H%M%S).html"
+  fi
+  write_html_report "$REPORT_PATH"
+  # If we're root (via --deep), hand ownership back to the invoking user.
+  if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+    chown "$SUDO_USER" "$REPORT_PATH" 2>/dev/null || true
+  fi
+  printf "  %s✔%s HTML report written to %s%s%s\n\n" \
+    "$C_GREEN" "$C_RESET" "$C_BOLD" "$REPORT_PATH" "$C_RESET"
+fi
+
+# Exit non-zero if any deal-breaker was found (useful for scripting).
+for s in "${FND_STATUS[@]}"; do [[ "$s" == "RED" ]] && exit 1; done
+exit 0
