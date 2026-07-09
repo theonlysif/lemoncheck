@@ -3,9 +3,7 @@ class Lemoncheck < Formula
   homepage "https://github.com/theonlysif/lemoncheck"
   url "https://github.com/theonlysif/lemoncheck/archive/refs/tags/v0.1.0.tar.gz"
   version "0.1.0"
-  # Replace with the real tarball sha256 once the v0.1.0 tag is published:
-  #   curl -sL <url> | shasum -a 256
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "ff0fc11dce84ae356b0e50428e2c6e32f82f3a8292bcf3f043e096f203400488"
   license "MIT"
   head "https://github.com/theonlysif/lemoncheck.git", branch: "main"
 
