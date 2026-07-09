@@ -15,7 +15,7 @@
 #
 set -uo pipefail
 
-LEMONCHECK_VERSION="0.1.0"
+LEMONCHECK_VERSION="0.1.1"
 
 # --- Resolve install dir (symlink-safe) so we can source lib/ ---------------
 _src="${BASH_SOURCE[0]}"

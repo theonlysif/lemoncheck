@@ -89,26 +89,50 @@ check_ssd_smart() {
     return
   fi
 
-  local units_written pct_used poh tbw
-  # NVMe: "Data Units Written" is in units of 1000 * 512 bytes = 512,000 bytes.
-  units_written="$(echo "$out" | awk -F: '/Data Units Written/{gsub(/[^0-9]/,"",$2); print $2; exit}')"
+  local duw_line pct_used poh tbw_tb tbw_disp
+  # smartctl prints the human total right in a bracket, e.g.
+  #   Data Units Written: 422,037,360 [216 TB]
+  # Read that bracket directly (parsing the raw count + comma separators is
+  # error-prone). Normalize GB/TB/PB to a numeric TB value for thresholds.
+  duw_line="$(echo "$out" | grep -iE "Data Units Written" | head -1)"
+  if [[ "$duw_line" =~ \[([0-9.]+)[[:space:]]*([GTP]B)\] ]]; then
+    local num="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+      GB) tbw_tb="$(awk -v n="$num" 'BEGIN{printf "%.2f", n/1000}')" ;;
+      TB) tbw_tb="$num" ;;
+      PB) tbw_tb="$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1000}')" ;;
+    esac
+    tbw_disp="${num} ${unit}"
+  else
+    # Fallback: first number group before any bracket × 512,000 bytes/unit.
+    local raw_units
+    raw_units="$(echo "$duw_line" | sed -E 's/.*:[[:space:]]*//; s/[[:space:]]*\[.*$//; s/,//g' | grep -oE '^[0-9]+')"
+    if [[ -n "$raw_units" && "$raw_units" -gt 0 ]] 2>/dev/null; then
+      tbw_tb="$(awk -v u="$raw_units" 'BEGIN{printf "%.1f", (u*512000)/1e12}')"
+      tbw_disp="${tbw_tb} TB"
+    fi
+  fi
+
   pct_used="$(echo "$out" | awk -F: '/Percentage Used/{gsub(/[^0-9]/,"",$2); print $2; exit}')"
   poh="$(echo "$out" | awk -F: '/Power On Hours|Power_On_Hours/{gsub(/[^0-9]/,"",$2); print $2; exit}')"
 
   local detail="" status=GREEN advice=""
-  if [[ -n "$units_written" && "$units_written" -gt 0 ]] 2>/dev/null; then
-    tbw="$(awk -v u="$units_written" 'BEGIN{printf "%.1f", (u*512000)/1e12}')"
-    detail="written: ${tbw} TB"
-  fi
+  [[ -n "$tbw_disp" ]] && detail="written: ${tbw_disp}"
   [[ -n "$pct_used" ]] && detail="${detail:+$detail  ·  }life used: ${pct_used}%"
   [[ -n "$poh" ]] && detail="${detail:+$detail  ·  }powered: ${poh}h"
 
-  if [[ -n "$pct_used" && "$pct_used" -ge 80 ]] 2>/dev/null; then
-    status=RED; advice="SSD reports ${pct_used}% of rated write life consumed — near end of life. This drive is not user-replaceable on modern Macs."
-  elif [[ -n "$pct_used" && "$pct_used" -ge 40 ]] 2>/dev/null; then
-    status=AMBER; advice="SSD is meaningfully worn (${pct_used}% life used). Fine for now but factor it in."
-  elif [[ -n "$tbw" ]] && awk -v t="$tbw" 'BEGIN{exit !(t>150)}'; then
-    status=AMBER; advice="High total bytes written (${tbw} TB). Heavy prior use."
+  # Prefer the drive's own normalized "% life used" — it already accounts for
+  # capacity and rated endurance. Only fall back to a raw-TBW heuristic when the
+  # controller doesn't expose a percentage (otherwise a big-but-healthy drive,
+  # e.g. 216 TB written yet 17% used, would cry wolf).
+  if [[ -n "$pct_used" ]]; then
+    if [[ "$pct_used" -ge 80 ]] 2>/dev/null; then
+      status=RED; advice="SSD reports ${pct_used}% of rated write life consumed — near end of life. This drive is not user-replaceable on modern Macs."
+    elif [[ "$pct_used" -ge 40 ]] 2>/dev/null; then
+      status=AMBER; advice="SSD is meaningfully worn (${pct_used}% life used). Fine for now but factor it in."
+    fi
+  elif [[ -n "$tbw_tb" ]] && awk -v t="$tbw_tb" 'BEGIN{exit !(t>300)}'; then
+    status=AMBER; advice="High total bytes written (${tbw_disp}) and the drive exposes no wear percentage. Heavy prior use — inspect closely."
   fi
   [[ -z "$detail" ]] && detail="SMART read but no wear counters"
   finding 2 "$status" "SSD wear (TBW)" "$detail" "$advice"
