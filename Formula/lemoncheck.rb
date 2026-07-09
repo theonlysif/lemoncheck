@@ -1,8 +1,8 @@
 class Lemoncheck < Formula
   desc "Inspect a used Mac before you buy it — traffic-light lemon detector"
   homepage "https://github.com/theonlysif/lemoncheck"
-  url "https://github.com/theonlysif/lemoncheck/archive/refs/tags/v0.1.1.tar.gz"
-  sha256 "5526e02bc44e7bb12d3c78a1f820b387a15b91460eb2c79829bc5381f6120218"
+  url "https://github.com/theonlysif/lemoncheck/archive/refs/tags/v0.2.0.tar.gz"
+  sha256 "954d5d580b954655b9a3c3247b9e8ce45e2e103cea0c869af91b1113f735f9a4"
   license "MIT"
   head "https://github.com/theonlysif/lemoncheck.git", branch: "main"
 
