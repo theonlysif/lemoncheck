@@ -1,0 +1,1015 @@
+#!/usr/bin/env bash
+#
+# lemoncheck — inspect a used Mac before you buy it.
+# Traffic-light report of the silent deal-breakers, wear metrics, and
+# component checks that turn a "good deal" into a bricked purchase.
+#
+# Usage:
+#   lemoncheck                 # standard scan (no sudo)
+#   lemoncheck --deep          # + MDM/DEP, firmware, full SSD SMART (uses sudo)
+#   lemoncheck --report [file] # also write a self-contained HTML report
+#   lemoncheck --listing "…"   # diff a pasted ad spec against the hardware
+#   lemoncheck --pixels        # run the fullscreen dead-pixel sweep
+#   lemoncheck --manual        # print the guided manual checklist only
+#   lemoncheck --version | --help
+#
+set -uo pipefail
+
+LEMONCHECK_VERSION="0.2.0"
+
+# ---- libraries inlined by build/bundle.sh (single-file build) ----
+
+# ===== lib/util.sh =====
+# lemoncheck — shared utilities, colors, and finding registry
+# shellcheck shell=bash
+
+# ---------------------------------------------------------------------------
+# Colors / formatting
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'; C_CYAN=$'\033[36m'; C_GREY=$'\033[90m'
+  C_REDBG=$'\033[41m'; C_YELBG=$'\033[43m'
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""
+  C_BLUE=""; C_CYAN=""; C_GREY=""; C_REDBG=""; C_YELBG=""
+fi
+
+# ---------------------------------------------------------------------------
+# Finding registry
+#
+# Every check appends one record to these parallel arrays. The report layer
+# renders them as a traffic-light summary and (optionally) an HTML report.
+#
+# Status values: RED (deal-breaker) | AMBER (wear/watch) | GREEN (ok)
+#                INFO (neutral fact) | MANUAL (needs human action)
+# ---------------------------------------------------------------------------
+FND_TIER=();  FND_STATUS=(); FND_TITLE=(); FND_DETAIL=(); FND_ADVICE=()
+
+# add_finding <tier> <status> <title> <detail> [advice]
+add_finding() {
+  FND_TIER+=("$1"); FND_STATUS+=("$2"); FND_TITLE+=("$3")
+  FND_DETAIL+=("$4"); FND_ADVICE+=("${5:-}")
+}
+
+# Live line printed as each check runs (so a slow run still feels responsive).
+print_line() {
+  local status="$1" title="$2" detail="$3"
+  local icon color
+  case "$status" in
+    RED)    icon="✖"; color="$C_RED" ;;
+    AMBER)  icon="▲"; color="$C_YELLOW" ;;
+    GREEN)  icon="✔"; color="$C_GREEN" ;;
+    MANUAL) icon="☐"; color="$C_CYAN" ;;
+    *)      icon="•"; color="$C_GREY" ;;
+  esac
+  printf "  %s%s%s %s%-34s%s %s\n" \
+    "$color" "$icon" "$C_RESET" "$C_BOLD" "$title" "$C_RESET" "${C_DIM}${detail}${C_RESET}"
+}
+
+# report + register in one shot
+finding() {
+  local tier="$1" status="$2" title="$3" detail="$4" advice="${5:-}"
+  add_finding "$tier" "$status" "$title" "$detail" "$advice"
+  print_line "$status" "$title" "$detail"
+}
+
+section() {
+  printf "\n%s%s%s\n" "$C_BOLD$C_BLUE" "$1" "$C_RESET"
+  printf "%s%s%s\n" "$C_GREY" "$(printf '─%.0s' $(seq 1 60))" "$C_RESET"
+}
+
+banner() {
+  printf "%s\n" "$C_BOLD$C_YELLOW"
+  cat <<'EOF'
+   _                                _               _
+  | | ___ _ __ ___   ___  _ __   ___| |__   ___  ___| | __
+  | |/ _ \ '_ ` _ \ / _ \| '_ \ / __| '_ \ / _ \/ __| |/ /
+  | |  __/ | | | | | (_) | | | | (__| | | |  __/ (__|   <
+  |_|\___|_| |_| |_|\___/|_| |_|\___|_| |_|\___|\___|_|\_\
+EOF
+  printf "%s" "$C_RESET"
+  printf "  %sused-mac lemon detector%s  ·  %sv%s%s\n\n" \
+    "$C_DIM" "$C_RESET" "$C_GREY" "${LEMONCHECK_VERSION:-0.1.0}" "$C_RESET"
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Portable timeout: run_to <seconds> <cmd...>. macOS has no coreutils `timeout`,
+# so we background the command and kill it if it overruns. Returns the command's
+# stdout; exit 124 on timeout.
+run_to() {
+  local secs="$1"; shift
+  local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/lc-to.XXXXXX")"
+  ( "$@" >"$tmp" 2>/dev/null ) &
+  local pid=$!
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [[ "$waited" -ge "$secs" ]]; then
+      kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+      cat "$tmp"; rm -f "$tmp"; return 124
+    fi
+    sleep 1; waited=$((waited+1))
+  done
+  wait "$pid" 2>/dev/null
+  cat "$tmp"; rm -f "$tmp"
+}
+
+is_root() { [[ "$(id -u)" -eq 0 ]]; }
+
+# Detect Apple Silicon vs Intel once.
+detect_arch() {
+  if [[ "$(uname -m)" == "arm64" ]]; then
+    MAC_ARCH="apple_silicon"
+  else
+    MAC_ARCH="intel"
+  fi
+}
+
+# Cache a system_profiler datatype as JSON once, reuse across checks.
+SP_CACHE_DIR=""
+sp_json() {
+  local datatype="$1"
+  [[ -n "$SP_CACHE_DIR" ]] || SP_CACHE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lemoncheck.XXXXXX")"
+  local f="$SP_CACHE_DIR/$datatype.json"
+  if [[ ! -f "$f" ]]; then
+    system_profiler -json "$datatype" >"$f" 2>/dev/null || echo '{}' >"$f"
+  fi
+  cat "$f"
+}
+
+cleanup_tmp() { [[ -n "$SP_CACHE_DIR" && -d "$SP_CACHE_DIR" ]] && rm -rf "$SP_CACHE_DIR"; }
+
+# jq wrapper that degrades gracefully if jq is missing.
+HAS_JQ=0
+jqr() { # jqr <filter> <json>
+  if [[ "$HAS_JQ" -eq 1 ]]; then
+    printf '%s' "$2" | jq -r "$1" 2>/dev/null
+  fi
+}
+
+# Round a float to an int (portable).
+round_int() { printf '%.0f' "$1" 2>/dev/null || echo 0; }
+
+# ===== lib/tier1_dealbreakers.sh =====
+# lemoncheck — Tier 1: deal-breakers ("walk away now")
+# shellcheck shell=bash disable=SC2155
+
+run_tier1() {
+  section "TIER 1 — Deal-breakers"
+
+  check_mdm_enrollment
+  check_activation_lock
+  check_firmware_lock
+  check_serial
+  check_persistence
+}
+
+# --- MDM / DEP enrollment ---------------------------------------------------
+check_mdm_enrollment() {
+  if ! is_root; then
+    finding 1 MANUAL "MDM / DEP enrollment" \
+      "needs sudo — re-run with 'lemoncheck --deep'" \
+      "This is the single most important check. Run: sudo profiles show -type enrollment"
+    return
+  fi
+
+  local enroll status combined
+  enroll="$(profiles show -type enrollment 2>/dev/null)"
+  status="$(profiles status -type enrollment 2>/dev/null)"
+  combined="$enroll"$'\n'"$status"
+
+  if echo "$combined" | grep -qiE "DEP|Device Enrollment|Automated Device Enrollment|Enrolled via DEP"; then
+    finding 1 RED "MDM / DEP enrollment" \
+      "ENROLLED via DEP / Apple Business Manager" \
+      "This Mac is owned by an organization. It will re-enroll into remote management on EVERY wipe and may be remotely locked or erased. WALK AWAY unless the seller can release it from ABM."
+  elif echo "$status" | grep -qiE "An enrollment profile is currently installed|MDM enrollment: Yes"; then
+    finding 1 AMBER "MDM / DEP enrollment" \
+      "MDM profile present (user-approved, non-DEP)" \
+      "A management profile is installed but not DEP-locked. Removable via a full erase, but confirm why it's there."
+  else
+    finding 1 GREEN "MDM / DEP enrollment" "not enrolled / no MDM profile"
+  fi
+}
+
+# --- Activation Lock / Find My ----------------------------------------------
+check_activation_lock() {
+  local al=""
+  # Apple Silicon surfaces this in SPHardwareDataType on recent macOS.
+  if [[ "$HAS_JQ" -eq 1 ]]; then
+    al="$(jqr '.SPHardwareDataType[0].activation_lock_status // empty' "$(sp_json SPHardwareDataType)")"
+  fi
+  if [[ -z "$al" ]]; then
+    al="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Activation Lock Status/{print $2; exit}')"
+  fi
+
+  case "$al" in
+    *[Ee]nabled*)
+      finding 1 RED "Activation Lock" \
+        "ENABLED — Find My is active" \
+        "The seller's Apple ID still owns this Mac. If they don't sign out (System Settings ▸ Apple ID ▸ Sign Out) BEFORE you pay, it becomes an unusable paperweight. Verify it reads Disabled after their sign-out." ;;
+    *[Dd]isabled*)
+      finding 1 GREEN "Activation Lock" "disabled" ;;
+    *)
+      finding 1 MANUAL "Activation Lock" \
+        "not reported — verify manually" \
+        "Confirm in System Settings ▸ General ▸ About (should not show Find My locked), and that Settings ▸ [Name] ▸ Find My ▸ Find My Mac is OFF and the seller is signed out of iCloud." ;;
+  esac
+}
+
+# --- Firmware password (Intel) / Recovery lock (Apple Silicon) --------------
+check_firmware_lock() {
+  if [[ "$MAC_ARCH" == "apple_silicon" ]]; then
+    if ! is_root; then
+      finding 1 MANUAL "Recovery lock (Apple Silicon)" \
+        "needs sudo to query securely" \
+        "Run 'lemoncheck --deep'. Also confirm you can boot to recoveryOS (hold power at startup) without an unknown password."
+      return
+    fi
+    local out
+    if have bputil; then
+      out="$(bputil -d 2>/dev/null)"
+    fi
+    # No public single-line 'recovery lock' flag; fall back to a boot-to-recovery prompt.
+    finding 1 MANUAL "Recovery lock (Apple Silicon)" \
+      "verify by booting recoveryOS" \
+      "Apple Silicon has no firmware password, but a Recovery Lock can block reinstall. Boot to recoveryOS (hold power) and confirm it does NOT demand an unknown password. Security policy: $( [[ -n "$out" ]] && echo "queried" || echo "bputil unavailable" )."
+  else
+    if ! is_root; then
+      finding 1 MANUAL "Firmware password (Intel)" \
+        "needs sudo — re-run with --deep" \
+        "Run: sudo firmwarepasswd -check"
+      return
+    fi
+    local fw
+    fw="$(firmwarepasswd -check 2>/dev/null)"
+    if echo "$fw" | grep -qi "Password Enabled: Yes"; then
+      finding 1 RED "Firmware password (Intel)" \
+        "ENABLED — locks recovery & alt-boot" \
+        "A firmware password blocks booting to recovery, USB, or target disk mode. Only the seller (or Apple with proof of purchase) can remove it. Get it cleared before buying."
+    else
+      finding 1 GREEN "Firmware password (Intel)" "not set"
+    fi
+  fi
+}
+
+# --- Serial number sanity ---------------------------------------------------
+check_serial() {
+  local serial model
+  if [[ "$HAS_JQ" -eq 1 ]]; then
+    local hw; hw="$(sp_json SPHardwareDataType)"
+    serial="$(jqr '.SPHardwareDataType[0].serial_number // empty' "$hw")"
+    model="$(jqr '.SPHardwareDataType[0].machine_name // .SPHardwareDataType[0].machine_model // empty' "$hw")"
+  fi
+  [[ -n "$serial" ]] || serial="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Serial Number/{print $2; exit}')"
+
+  if [[ -z "$serial" || "$serial" == "Not Available" ]]; then
+    finding 1 AMBER "Serial number" \
+      "MISSING / blanked" \
+      "A blank or unavailable serial is a red flag for a replaced logic board or tampered device. Investigate before buying."
+    return
+  fi
+
+  # Basic shape check: modern serials are 10-12 alphanumerics.
+  if [[ ${#serial} -lt 8 ]]; then
+    finding 1 AMBER "Serial number" \
+      "unusual: $serial" \
+      "Serial looks malformed. Cross-check against Apple's coverage page."
+  else
+    finding 1 INFO "Serial number" \
+      "$serial ${model:+($model)}" \
+      "Cross-check on Apple's coverage page — it must resolve to the SAME model you're looking at. A mismatch or 'not found' can mean a swapped board, grey-market, or stolen unit."
+  fi
+  LEMON_SERIAL="$serial"
+  LEMON_MODEL="$model"
+}
+
+# --- Persistence audit (leftover launch items / profiles) -------------------
+check_persistence() {
+  local dirs=(
+    "/Library/LaunchDaemons"
+    "/Library/LaunchAgents"
+    "$HOME/Library/LaunchAgents"
+  )
+  local suspicious=0 total=0 details=""
+  local d f base
+  for d in "${dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      base="$(basename "$f")"
+      total=$((total+1))
+      # Apple's own items live under com.apple.* — flag third-party ones.
+      if [[ "$base" != com.apple.* ]]; then
+        suspicious=$((suspicious+1))
+        details+="${base} "
+      fi
+    done < <(find "$d" -maxdepth 1 -type f \( -name '*.plist' \) 2>/dev/null)
+  done
+
+  if [[ "$suspicious" -gt 0 ]]; then
+    finding 1 AMBER "Persistence audit" \
+      "$suspicious third-party launch item(s)" \
+      "Left-behind launch agents/daemons can be adware, keyloggers, or parental spyware. Review each before trusting the machine (a clean install removes them): ${details}"
+  else
+    finding 1 GREEN "Persistence audit" "no third-party launch items"
+  fi
+
+  # Config profiles
+  local prof
+  if is_root; then
+    prof="$(profiles list 2>/dev/null)"
+  else
+    prof="$(profiles -P 2>/dev/null || profiles list 2>/dev/null)"
+  fi
+  if echo "$prof" | grep -qiE "profileIdentifier|_computerlevel|There are.*profiles installed"; then
+    if echo "$prof" | grep -qi "There are no configuration profiles"; then
+      finding 1 GREEN "Configuration profiles" "none installed"
+    else
+      local n; n="$(echo "$prof" | grep -ciE "profileIdentifier|attribute: profileIdentifier")"
+      finding 1 AMBER "Configuration profiles" \
+        "${n:-some} profile(s) installed" \
+        "Config profiles can silently redirect DNS, install root certs, or restrict the machine. Review: sudo profiles list -verbose"
+    fi
+  else
+    finding 1 GREEN "Configuration profiles" "none detected"
+  fi
+}
+
+# ===== lib/tier2_wear.sh =====
+# lemoncheck — Tier 2: wear & true condition
+# shellcheck shell=bash disable=SC2155
+
+run_tier2() {
+  section "TIER 2 — Wear & true condition"
+
+  check_battery
+  check_ssd_smart
+  check_kernel_panics
+  check_thermal
+  check_os_installs
+}
+
+# --- Battery: wear % + cycles (more honest than the Normal/Service label) ---
+check_battery() {
+  local raw design maxcap cycles condition
+  raw="$(system_profiler SPPowerDataType 2>/dev/null)"
+  if [[ -z "$raw" ]] || ! echo "$raw" | grep -qi "Cycle Count"; then
+    finding 2 INFO "Battery" "no battery (desktop Mac?)"
+    return
+  fi
+
+  cycles="$(echo "$raw" | awk -F': ' '/Cycle Count/{print $2; exit}')"
+  condition="$(echo "$raw" | awk -F': ' '/Condition/{print $2; exit}')"
+
+  # Prefer ioreg for exact mAh capacities.
+  local ir
+  ir="$(ioreg -r -c AppleSmartBattery 2>/dev/null)"
+  maxcap="$(echo "$ir"  | awk -F'= ' '/\"AppleRawMaxCapacity\"/{print $2; exit}')"
+  design="$(echo "$ir"  | awk -F'= ' '/\"DesignCapacity\"/{print $2; exit}')"
+
+  local wear=""
+  if [[ -n "$maxcap" && -n "$design" && "$design" -gt 0 ]] 2>/dev/null; then
+    wear="$(awk -v m="$maxcap" -v d="$design" 'BEGIN{printf "%.0f", (m/d)*100}')"
+  fi
+
+  local status detail advice
+  detail="cycles: ${cycles:-?}"
+  [[ -n "$wear" ]] && detail="health: ${wear}%  ·  ${detail}"
+  [[ -n "$condition" ]] && detail="$detail  ·  ${condition}"
+
+  if [[ "$condition" == *Service* || "$condition" == *Replace* ]]; then
+    status=RED
+    advice="macOS itself flags this battery for service. Factor a battery replacement into the price."
+  elif [[ -n "$wear" && "$wear" -lt 80 ]] 2>/dev/null; then
+    status=AMBER
+    advice="Battery health under 80% — noticeably degraded. Expect reduced runtime; budget for replacement."
+  elif [[ -n "$cycles" && "$cycles" -gt 1000 ]] 2>/dev/null; then
+    status=AMBER
+    advice="High cycle count. Battery is deep into its rated life."
+  else
+    status=GREEN
+    advice=""
+  fi
+  finding 2 "$status" "Battery" "$detail" "$advice"
+}
+
+# --- SSD terabytes-written (the sleeper metric) -----------------------------
+check_ssd_smart() {
+  local sm
+  sm="$(command -v smartctl || echo "")"
+  if [[ -z "$sm" ]]; then
+    finding 2 MANUAL "SSD wear (TBW)" \
+      "smartmontools not installed" \
+      "Install with 'brew install smartmontools', then re-run. TBW (terabytes written) reveals how hammered the SSD is — a drive with 200TB written is near end-of-life even if it 'works.'"
+    return
+  fi
+
+  # Internal NVMe on Apple Silicon lives behind the AppleANS controller; smartctl
+  # can read it on many machines but not all. Try the common device nodes.
+  local dev out=""
+  for dev in /dev/disk0 /dev/rdisk0; do
+    # Guard with a timeout — smartctl can hang on some Apple NVMe controllers.
+    out="$(run_to 12 "$sm" -a "$dev")"
+    [[ -n "$out" ]] && echo "$out" | grep -qiE "Data Units Written|Percentage Used|Power_On_Hours" && break
+  done
+
+  if [[ -z "$out" ]] || ! echo "$out" | grep -qiE "Data Units Written|Percentage Used|Power On Hours"; then
+    if ! is_root; then
+      finding 2 MANUAL "SSD wear (TBW)" \
+        "needs sudo — re-run with --deep" \
+        "Run: sudo smartctl -a /dev/disk0"
+    else
+      finding 2 MANUAL "SSD wear (TBW)" \
+        "SMART not exposed on this controller" \
+        "Some Apple SSDs don't expose SMART to smartctl. Watch for slow performance and check kernel panics as a proxy."
+    fi
+    return
+  fi
+
+  local duw_line pct_used poh tbw_tb tbw_disp
+  # smartctl prints the human total right in a bracket, e.g.
+  #   Data Units Written: 422,037,360 [216 TB]
+  # Read that bracket directly (parsing the raw count + comma separators is
+  # error-prone). Normalize GB/TB/PB to a numeric TB value for thresholds.
+  duw_line="$(echo "$out" | grep -iE "Data Units Written" | head -1)"
+  if [[ "$duw_line" =~ \[([0-9.]+)[[:space:]]*([GTP]B)\] ]]; then
+    local num="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+      GB) tbw_tb="$(awk -v n="$num" 'BEGIN{printf "%.2f", n/1000}')" ;;
+      TB) tbw_tb="$num" ;;
+      PB) tbw_tb="$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1000}')" ;;
+    esac
+    tbw_disp="${num} ${unit}"
+  else
+    # Fallback: first number group before any bracket × 512,000 bytes/unit.
+    local raw_units
+    raw_units="$(echo "$duw_line" | sed -E 's/.*:[[:space:]]*//; s/[[:space:]]*\[.*$//; s/,//g' | grep -oE '^[0-9]+')"
+    if [[ -n "$raw_units" && "$raw_units" -gt 0 ]] 2>/dev/null; then
+      tbw_tb="$(awk -v u="$raw_units" 'BEGIN{printf "%.1f", (u*512000)/1e12}')"
+      tbw_disp="${tbw_tb} TB"
+    fi
+  fi
+
+  pct_used="$(echo "$out" | awk -F: '/Percentage Used/{gsub(/[^0-9]/,"",$2); print $2; exit}')"
+  poh="$(echo "$out" | awk -F: '/Power On Hours|Power_On_Hours/{gsub(/[^0-9]/,"",$2); print $2; exit}')"
+
+  local detail="" status=GREEN advice=""
+  [[ -n "$tbw_disp" ]] && detail="written: ${tbw_disp}"
+  [[ -n "$pct_used" ]] && detail="${detail:+$detail  ·  }life used: ${pct_used}%"
+  [[ -n "$poh" ]] && detail="${detail:+$detail  ·  }powered: ${poh}h"
+
+  # Prefer the drive's own normalized "% life used" — it already accounts for
+  # capacity and rated endurance. Only fall back to a raw-TBW heuristic when the
+  # controller doesn't expose a percentage (otherwise a big-but-healthy drive,
+  # e.g. 216 TB written yet 17% used, would cry wolf).
+  if [[ -n "$pct_used" ]]; then
+    if [[ "$pct_used" -ge 80 ]] 2>/dev/null; then
+      status=RED; advice="SSD reports ${pct_used}% of rated write life consumed — near end of life. This drive is not user-replaceable on modern Macs."
+    elif [[ "$pct_used" -ge 40 ]] 2>/dev/null; then
+      status=AMBER; advice="SSD is meaningfully worn (${pct_used}% life used). Fine for now but factor it in."
+    fi
+  elif [[ -n "$tbw_tb" ]] && awk -v t="$tbw_tb" 'BEGIN{exit !(t>300)}'; then
+    status=AMBER; advice="High total bytes written (${tbw_disp}) and the drive exposes no wear percentage. Heavy prior use — inspect closely."
+  fi
+  [[ -z "$detail" ]] && detail="SMART read but no wear counters"
+  finding 2 "$status" "SSD wear (TBW)" "$detail" "$advice"
+}
+
+# --- Kernel panic history ---------------------------------------------------
+check_kernel_panics() {
+  local dir="/Library/Logs/DiagnosticReports"
+  local count recent
+  count=0; recent=0
+  if [[ -d "$dir" ]]; then
+    count="$(find "$dir" -maxdepth 1 -name '*.panic' 2>/dev/null | wc -l | tr -d ' ')"
+    recent="$(find "$dir" -maxdepth 1 -name '*.panic' -mtime -30 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+
+  if [[ "$count" -eq 0 ]]; then
+    finding 2 GREEN "Kernel panics" "none on record"
+  elif [[ "$recent" -gt 0 ]]; then
+    finding 2 RED "Kernel panics" \
+      "$count total, $recent in last 30 days" \
+      "Recent kernel panics point at failing hardware (RAM, SSD, GPU, logic board) that a reinstall won't fix. Inspect the .panic files in $dir."
+  else
+    finding 2 AMBER "Kernel panics" \
+      "$count total (none recent)" \
+      "Older panics — could be resolved or dormant hardware trouble. Worth asking the seller about."
+  fi
+}
+
+# --- Thermal state ----------------------------------------------------------
+# NOTE: use only the one-shot `pmset -g therm`. `pmset -g thermlog` STREAMS
+# thermal events forever and never returns — it must never be called here.
+check_thermal() {
+  local therm
+  therm="$(pmset -g therm 2>/dev/null)"
+
+  # CPU scheduler / speed limit < 100 means the CPU is being throttled now.
+  local level
+  level="$(echo "$therm" | awk -F= '/CPU_Scheduler_Limit|CPU_Speed_Limit/{gsub(/[^0-9]/,"",$2); print $2; exit}')"
+
+  if echo "$therm" | grep -qiE "thermal warning level.*[1-9]|CPU power.*[1-9]"; then
+    finding 2 AMBER "Thermal state" \
+      "warning level recorded" \
+      "The system has logged a thermal warning — possible dried paste, blocked fans, or prior liquid damage. Stress-test and listen to the fans."
+  elif [[ -n "$level" && "$level" -lt 100 ]] 2>/dev/null; then
+    finding 2 AMBER "Thermal state" \
+      "CPU currently limited to ${level}%" \
+      "The CPU is being thermally limited right now. Let it cool and re-check; if persistent, cooling is compromised."
+  else
+    finding 2 GREEN "Thermal state" "no active throttling"
+  fi
+}
+
+# --- OS install / restore count & dates -------------------------------------
+check_os_installs() {
+  # Root filesystem creation time is the most reliable proxy for the last clean
+  # install/erase. (InstallHistory counts every delta update too, so it wildly
+  # overstates "installs" — we report it only as informational context.)
+  local created
+  created="$(stat -f '%SB' -t '%Y-%m-%d' / 2>/dev/null)"
+
+  local detail="root fs created: ${created:-unknown}"
+
+  # Flag a *very recently* wiped machine — a fresh erase right before sale can be
+  # legitimate, but it also conveniently hides history. Worth a gentle note.
+  local created_epoch now_epoch age_days
+  created_epoch="$(stat -f '%B' / 2>/dev/null)"
+  now_epoch="$(date +%s 2>/dev/null)"
+  if [[ -n "$created_epoch" && -n "$now_epoch" ]]; then
+    age_days=$(( (now_epoch - created_epoch) / 86400 ))
+    detail="$detail  (~${age_days}d ago)"
+    if [[ "$age_days" -lt 7 ]]; then
+      finding 2 AMBER "OS install history" "$detail" \
+        "The system volume was created in the last week — a fresh wipe right before sale. Usually fine, but it erases the machine's history (panics, logs), so lean harder on the hardware checks."
+      return
+    fi
+  fi
+  finding 2 INFO "OS install history" "$detail"
+}
+
+# ===== lib/tier3_components.sh =====
+# lemoncheck — Tier 3: does every component actually work
+# Auto-detect what hardware reports as present, then hand off a guided
+# manual checklist for things Terminal can detect-but-not-exercise.
+# shellcheck shell=bash disable=SC2155
+
+run_tier3() {
+  section "TIER 3 — Component presence (auto)"
+
+  check_memory
+  check_ports
+  check_wireless
+  check_gpu
+  check_camera
+  check_displays
+  check_audio
+}
+
+check_memory() {
+  local raw total
+  raw="$(system_profiler SPMemoryDataType 2>/dev/null)"
+  total="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Memory:/{print $2; exit}')"
+  finding 3 INFO "Memory (RAM)" "${total:-unknown} reported present" \
+    "Compare against the listing. On Apple Silicon RAM is fused to the SoC (can't be swapped), so 'reports 8GB' must equal what you paid for."
+  LEMON_RAM="$total"
+}
+
+check_ports() {
+  local usb tb
+  usb="$(system_profiler SPUSBDataType 2>/dev/null | grep -c "Product ID\|BSD Name\|Manufacturer")"
+  tb="$(system_profiler SPThunderboltDataType 2>/dev/null | grep -c "Device Name\|Vendor Name")"
+  local busses
+  busses="$(system_profiler SPThunderboltDataType 2>/dev/null | grep -c "Thunderbolt.*Bus\|Bus:")"
+  finding 3 INFO "USB / Thunderbolt busses" \
+    "${busses:-?} TB bus(es) enumerated" \
+    "Presence ≠ function. Manually test EACH port with a real drive (see guided checklist) — a dead port often means logic-board damage."
+}
+
+check_wireless() {
+  local air bt_raw wifi_card bt_chip
+  air="$(system_profiler SPAirPortDataType 2>/dev/null)"
+  bt_raw="$(system_profiler SPBluetoothDataType 2>/dev/null)"
+
+  # Card Type line only exists when a Wi-Fi interface is actually present.
+  wifi_card="$(echo "$air" | awk -F': ' '/Card Type/{print $2; exit}')"
+  if [[ -n "$wifi_card" ]] || echo "$air" | grep -qiE "Interfaces:|en[0-9]+:"; then
+    finding 3 GREEN "Wi-Fi" "chip detected${wifi_card:+ (${wifi_card%% *})}"
+  else
+    finding 3 AMBER "Wi-Fi" "no Wi-Fi interface reported" \
+      "Could not read a Wi-Fi card. This can mean logic-board/antenna damage — confirm by actually joining a network before buying."
+  fi
+
+  bt_chip="$(echo "$bt_raw" | awk -F': ' '/Chipset/{print $2; exit}')"
+  if [[ -n "$bt_chip" ]] || echo "$bt_raw" | grep -qiE "Bluetooth Controller|Address:"; then
+    finding 3 GREEN "Bluetooth" "chip detected${bt_chip:+ ($bt_chip)}"
+  else
+    finding 3 AMBER "Bluetooth" "not detected" \
+      "No Bluetooth radio found. Test by pairing a device."
+  fi
+}
+
+check_gpu() {
+  local gpus
+  gpus="$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model/{print $2}' | paste -sd', ' -)"
+  if [[ -n "$gpus" ]]; then
+    finding 3 GREEN "GPU(s)" "$gpus"
+  else
+    finding 3 AMBER "GPU(s)" "none reported" "Could not read GPU. Check for graphical glitches on screen."
+  fi
+}
+
+check_camera() {
+  # SPCameraDataType is empty on many recent macOS builds, so fall back to ioreg.
+  if system_profiler SPCameraDataType 2>/dev/null | grep -qiE "Camera|FaceTime" \
+     || ioreg -l 2>/dev/null | grep -qiE "AppleH1[0-9]CamIn|AppleCamIn|FaceTime|VDC-.*Camera"; then
+    finding 3 GREEN "Camera" "device present" \
+      "Presence only — open Photo Booth to confirm it produces a live image."
+  else
+    # Absence here is usually a reporting gap, not a missing camera — don't alarm.
+    finding 3 MANUAL "Camera" "not reported — verify manually" \
+      "macOS didn't expose the camera to system_profiler (common). Open Photo Booth to confirm it produces a live image."
+  fi
+}
+
+check_displays() {
+  local disp count
+  disp="$(system_profiler SPDisplaysDataType 2>/dev/null | grep -cE "Resolution|Display Type")"
+  count="$(system_profiler SPDisplaysDataType 2>/dev/null | grep -cE "^ +[A-Za-z].*:$" )"
+  finding 3 INFO "Displays" "$( [[ "$disp" -gt 0 ]] && echo "$disp display attribute(s) reported" || echo "check manually" )" \
+    "Run the guided dead-pixel sweep to check the panel for dead/stuck pixels and backlight bleed."
+}
+
+check_audio() {
+  local out in
+  out="$(system_profiler SPAudioDataType 2>/dev/null | grep -c "Output\|Speaker")"
+  in="$(system_profiler SPAudioDataType 2>/dev/null | grep -c "Input\|Microphone")"
+  if [[ "$out" -gt 0 || "$in" -gt 0 ]]; then
+    finding 3 GREEN "Audio devices" "output & input present" \
+      "Presence only — use the guided speaker L/R and mic record-playback tests."
+  else
+    finding 3 AMBER "Audio devices" "none reported" "No audio devices detected."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Guided manual checklist — printed at the end, optionally interactive.
+# ---------------------------------------------------------------------------
+run_manual_checklist() {
+  section "TIER 3 — Guided manual checklist"
+  cat <<EOF
+  ${C_DIM}Terminal can see hardware is present, but only YOU can confirm it works.
+  Walk these with the machine in front of you:${C_RESET}
+
+  ${C_BOLD}Display${C_RESET}
+    ☐ Dead-pixel sweep — fill the screen with solid red, green, blue, white,
+      black. Look for stuck dots, dark patches, backlight bleed.
+      ${C_CYAN}lemoncheck --pixels${C_RESET} throws these up fullscreen for you.
+    ☐ Tilt the lid through its full range — flicker = failing display cable.
+
+  ${C_BOLD}Input${C_RESET}
+    ☐ Keyboard — press every key (open a text field or a key-test site).
+    ☐ Trackpad — click all four corners; test force-click / haptics.
+    ☐ Sticky/mushy keys, especially on butterfly-keyboard-era MacBooks.
+
+  ${C_BOLD}Audio${C_RESET}
+    ☐ Speakers — play stereo audio, confirm BOTH left and right, no rattle.
+    ☐ Microphone — record a memo and play it back.
+    ☐ Headphone jack (if present) — plug in and listen.
+
+  ${C_BOLD}Ports${C_RESET}
+    ☐ Every USB-C / Thunderbolt / USB-A port with a REAL drive — data + charge.
+    ☐ HDMI / SD / MagSafe where present.
+
+  ${C_BOLD}Other${C_RESET}
+    ☐ Camera — live image in Photo Booth.
+    ☐ Wi-Fi — actually join a network and load a page.
+    ☐ Bluetooth — pair a device.
+    ☐ Fans — push CPU load, listen for grinding/rattle, feel for airflow.
+    ☐ Touch ID / power button — enroll a fingerprint.
+    ☐ Every physical hinge, foot, and port for cracks or prior-repair marks.
+EOF
+}
+
+# Fullscreen solid-color sweep for the dead-pixel test.
+#
+# Paints the whole terminal a solid color. For a true edge-to-edge test, put the
+# terminal in fullscreen first (View ▸ Enter Full Screen, or ⌃⌘F). Cheap,
+# dependency-free, and works over SSH-less local sessions on any macOS version.
+run_pixel_test() {
+  echo "Dead-pixel sweep — the terminal will fill with solid colors."
+  echo "Tip: put this window in FULL SCREEN (⌃⌘F) first for edge-to-edge coverage."
+  echo "Look for dots stuck the wrong color, dark patches, or backlight bleed."
+  echo
+  read -r -p "Press Return to begin... " _ </dev/tty
+
+  local colors=("RED:41" "GREEN:42" "BLUE:44" "WHITE:107" "BLACK:40" "GREY:100")
+  local c name code
+  for c in "${colors[@]}"; do
+    name="${c%%:*}"; code="${c##*:}"
+    _pixel_fill "$name" "$code"
+  done
+  clear
+  echo "Pixel sweep complete. Any pixel that never matched the field is dead/stuck."
+}
+
+# Paint the terminal one solid color until the user presses Return.
+_pixel_fill() {
+  local name="$1" code="$2"
+  local cols lines y
+  cols="$(tput cols 2>/dev/null || echo 80)"
+  lines="$(tput lines 2>/dev/null || echo 24)"
+  clear
+  printf '\033[%sm' "$code"
+  for ((y=0; y<lines; y++)); do printf '%*s\n' "$cols" ''; done
+  printf '\033[0m'
+  # Re-position cursor to top so the prompt is readable on light fields.
+  tput cup 0 0 2>/dev/null || true
+  read -r -p "  [$name] Return for next color " _ </dev/tty
+}
+
+# ===== lib/tier4_extras.sh =====
+# lemoncheck — Tier 4: nice-to-haves
+# shellcheck shell=bash disable=SC2155
+
+run_tier4() {
+  section "TIER 4 — Extras"
+
+  check_listing_diff
+  check_value_sanity
+}
+
+# --- Listing diff: compare detected config against what the seller claims ----
+# Usage: set LEMON_LISTING to a free-text spec (from --listing). We grep numbers.
+check_listing_diff() {
+  if [[ -z "${LEMON_LISTING:-}" ]]; then
+    finding 4 INFO "Listing diff" \
+      "no listing provided" \
+      "Re-run with --listing \"16GB 512GB M2 Pro\" to auto-diff the ad against the machine."
+    return
+  fi
+
+  local claimed_ram claimed_ssd
+  claimed_ram="$(echo "$LEMON_LISTING" | grep -oiE '[0-9]+ ?GB' | head -1 | grep -oiE '[0-9]+')"
+  # crude: a second GB/TB number is likely storage
+  claimed_ssd="$(echo "$LEMON_LISTING" | grep -oiE '[0-9]+ ?(TB|GB)' | sed -n '2p')"
+
+  local actual_ram_gb
+  actual_ram_gb="$(echo "${LEMON_RAM:-}" | grep -oiE '[0-9]+')"
+
+  local mismatch=""
+  if [[ -n "$claimed_ram" && -n "$actual_ram_gb" && "$claimed_ram" != "$actual_ram_gb" ]]; then
+    mismatch="RAM: listing says ${claimed_ram}GB, machine reports ${actual_ram_gb}GB. "
+  fi
+
+  if [[ -n "$mismatch" ]]; then
+    finding 4 RED "Listing diff" "$mismatch" \
+      "The advertised specs don't match the hardware. Classic bait-and-switch or a wrong/relisted unit."
+  else
+    finding 4 GREEN "Listing diff" "no obvious mismatch vs \"$LEMON_LISTING\""
+  fi
+}
+
+# --- Rough value / resale sanity --------------------------------------------
+check_value_sanity() {
+  local model="${LEMON_MODEL:-$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Model Name/{print $2; exit}')}"
+  local chip
+  chip="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Chip:|Processor Name/{print $2; exit}')"
+  finding 4 INFO "Value sanity" \
+    "${model:-Mac} · ${chip:-?} · RAM ${LEMON_RAM:-?}" \
+    "Cross-reference this exact model + chip + storage against completed sales on eBay/Swappa. If the asking price is far below market, ask WHY — it usually correlates with a Tier-1 red flag above."
+}
+
+# ===== lib/report.sh =====
+# lemoncheck — summary + HTML/report export
+# shellcheck shell=bash disable=SC2155
+
+# Print the traffic-light verdict and tally.
+print_summary() {
+  local reds=0 ambers=0 greens=0 manuals=0 i
+  for i in "${!FND_STATUS[@]}"; do
+    case "${FND_STATUS[$i]}" in
+      RED)    reds=$((reds+1)) ;;
+      AMBER)  ambers=$((ambers+1)) ;;
+      GREEN)  greens=$((greens+1)) ;;
+      MANUAL) manuals=$((manuals+1)) ;;
+    esac
+  done
+
+  section "VERDICT"
+
+  # Overall traffic light.
+  if [[ "$reds" -gt 0 ]]; then
+    printf "  %s%s  ●  DO NOT BUY (yet) — %d deal-breaker(s)  %s\n" \
+      "$C_REDBG$C_BOLD" " " "$reds" "$C_RESET"
+  elif [[ "$ambers" -gt 0 ]]; then
+    printf "  %s%s  ●  PROCEED WITH CAUTION — %d wear/watch item(s)  %s\n" \
+      "$C_YELBG$C_BOLD" " " "$ambers" "$C_RESET"
+  else
+    printf "  %s%s  ●  LOOKS CLEAN — no automated red/amber flags  %s\n" \
+      "$C_GREEN$C_BOLD" "" "$C_RESET"
+  fi
+
+  printf "\n  %s✖ %d red   ▲ %d amber   ✔ %d green   ☐ %d manual%s\n" \
+    "$C_DIM" "$reds" "$ambers" "$greens" "$manuals" "$C_RESET"
+
+  # Repeat the actionable items so the user doesn't scroll.
+  if [[ "$reds" -gt 0 || "$ambers" -gt 0 ]]; then
+    printf "\n  %sAction items:%s\n" "$C_BOLD" "$C_RESET"
+    for i in "${!FND_STATUS[@]}"; do
+      case "${FND_STATUS[$i]}" in
+        RED)   printf "   %s✖%s %s — %s\n" "$C_RED" "$C_RESET" "${FND_TITLE[$i]}" "${FND_DETAIL[$i]}" ;;
+        AMBER) printf "   %s▲%s %s — %s\n" "$C_YELLOW" "$C_RESET" "${FND_TITLE[$i]}" "${FND_DETAIL[$i]}" ;;
+      esac
+    done
+  fi
+
+  if ! is_root; then
+    printf "\n  %sSome deep checks were skipped. Re-run with %slemoncheck --deep%s%s for MDM,\n  firmware, and full SSD SMART results.%s\n" \
+      "$C_DIM" "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+  fi
+  echo
+}
+
+# Escape a string for safe HTML embedding.
+_html_escape() {
+  local s="$1"
+  s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"; s="${s//\"/&quot;}"
+  printf '%s' "$s"
+}
+
+# Write a self-contained HTML report to $1.
+write_html_report() {
+  local out="$1"
+  local host model serial when
+  host="$(scutil --get ComputerName 2>/dev/null || hostname)"
+  model="${LEMON_MODEL:-$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Model Name/{print $2; exit}')}"
+  serial="${LEMON_SERIAL:-unknown}"
+  when="$(date '+%Y-%m-%d %H:%M %Z')"
+
+  local reds=0 ambers=0 greens=0 i
+  for i in "${!FND_STATUS[@]}"; do
+    case "${FND_STATUS[$i]}" in
+      RED) reds=$((reds+1)) ;; AMBER) ambers=$((ambers+1)) ;; GREEN) greens=$((greens+1)) ;;
+    esac
+  done
+
+  local verdict verdict_class
+  if [[ "$reds" -gt 0 ]]; then verdict="DO NOT BUY — $reds deal-breaker(s)"; verdict_class="red"
+  elif [[ "$ambers" -gt 0 ]]; then verdict="PROCEED WITH CAUTION — $ambers watch item(s)"; verdict_class="amber"
+  else verdict="LOOKS CLEAN"; verdict_class="green"; fi
+
+  {
+    cat <<HTML
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lemoncheck report — $(_html_escape "$model")</title>
+<style>
+  :root{--red:#d64545;--amber:#d99a1c;--green:#2e9e5b;--bg:#f7f7f5;--card:#fff;--ink:#1a1a1a;--muted:#666;--line:#e5e5e0}
+  @media (prefers-color-scheme:dark){:root{--bg:#141414;--card:#1e1e1e;--ink:#eee;--muted:#999;--line:#2c2c2c}}
+  *{box-sizing:border-box}
+  body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--ink)}
+  .wrap{max-width:820px;margin:0 auto;padding:32px 20px 64px}
+  h1{font-size:22px;margin:0 0 4px;display:flex;align-items:center;gap:10px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:24px}
+  .verdict{padding:18px 22px;border-radius:12px;font-weight:700;font-size:18px;color:#fff;margin-bottom:8px}
+  .verdict.red{background:var(--red)}.verdict.amber{background:var(--amber)}.verdict.green{background:var(--green)}
+  .tally{display:flex;gap:16px;color:var(--muted);font-size:13px;margin:14px 0 28px}
+  .tier{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:26px 0 8px;font-weight:700}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .row{display:flex;gap:12px;padding:14px 16px;border-top:1px solid var(--line);align-items:flex-start}
+  .row:first-child{border-top:none}
+  .dot{flex:none;width:10px;height:10px;border-radius:50%;margin-top:6px}
+  .dot.RED{background:var(--red)}.dot.AMBER{background:var(--amber)}.dot.GREEN{background:var(--green)}
+  .dot.MANUAL{background:#4a90d6}.dot.INFO{background:#aaa}
+  .rc{flex:1;min-width:0}
+  .rt{font-weight:600}
+  .rd{color:var(--muted);font-size:13px;margin-top:2px;word-break:break-word}
+  .ra{font-size:13px;margin-top:6px;padding:8px 10px;background:rgba(127,127,127,.08);border-radius:8px}
+  footer{color:var(--muted);font-size:12px;margin-top:36px;text-align:center}
+</style></head><body><div class="wrap">
+<h1>🍋 lemoncheck report</h1>
+<div class="sub">$(_html_escape "$model") &middot; serial $(_html_escape "$serial") &middot; $(_html_escape "$host") &middot; $(_html_escape "$when")</div>
+<div class="verdict $verdict_class">$(_html_escape "$verdict")</div>
+<div class="tally">✖ $reds red &nbsp; ▲ $ambers amber &nbsp; ✔ $greens green</div>
+HTML
+
+    local last_tier=""
+    for i in "${!FND_STATUS[@]}"; do
+      local tier="${FND_TIER[$i]}" st="${FND_STATUS[$i]}"
+      if [[ "$tier" != "$last_tier" ]]; then
+        [[ -n "$last_tier" ]] && echo "</div>"
+        local label
+        case "$tier" in
+          1) label="Tier 1 — Deal-breakers" ;;
+          2) label="Tier 2 — Wear &amp; condition" ;;
+          3) label="Tier 3 — Components" ;;
+          4) label="Tier 4 — Extras" ;;
+          *) label="Other" ;;
+        esac
+        echo "<div class=\"tier\">$label</div><div class=\"card\">"
+        last_tier="$tier"
+      fi
+      printf '<div class="row"><span class="dot %s"></span><div class="rc"><div class="rt">%s</div><div class="rd">%s</div>%s</div></div>\n' \
+        "$st" \
+        "$(_html_escape "${FND_TITLE[$i]}")" \
+        "$(_html_escape "${FND_DETAIL[$i]}")" \
+        "$( [[ -n "${FND_ADVICE[$i]}" ]] && printf '<div class="ra">%s</div>' "$(_html_escape "${FND_ADVICE[$i]}")" )"
+    done
+    [[ -n "$last_tier" ]] && echo "</div>"
+
+    cat <<HTML
+<footer>Generated by lemoncheck v${LEMONCHECK_VERSION:-0.1.0} — a used-Mac lemon detector.<br>
+All checks run locally. This report is evidence you can keep or share with the seller.</footer>
+</div></body></html>
+HTML
+  } > "$out"
+}
+
+usage() {
+  sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# --- Parse args -------------------------------------------------------------
+DEEP=0; DO_REPORT=0; REPORT_PATH=""; PIXELS_ONLY=0; MANUAL_ONLY=0
+LEMON_LISTING="${LEMON_LISTING:-}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --deep) DEEP=1 ;;
+    --report)
+      DO_REPORT=1
+      if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then REPORT_PATH="$2"; shift; fi ;;
+    --listing)
+      LEMON_LISTING="${2:-}"; shift ;;
+    --pixels) PIXELS_ONLY=1 ;;
+    --manual) MANUAL_ONLY=1 ;;
+    -v|--version) echo "lemoncheck $LEMONCHECK_VERSION"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "lemoncheck: unknown option '$1'" >&2; usage; exit 2 ;;
+  esac
+  shift
+done
+
+# --- Environment setup ------------------------------------------------------
+have jq && HAS_JQ=1 || HAS_JQ=0
+detect_arch
+trap cleanup_tmp EXIT
+
+# Standalone modes.
+if [[ "$PIXELS_ONLY" -eq 1 ]]; then run_pixel_test; exit 0; fi
+if [[ "$MANUAL_ONLY" -eq 1 ]]; then run_manual_checklist; exit 0; fi
+
+# --- Re-exec under sudo for --deep so privileged checks work ----------------
+if [[ "$DEEP" -eq 1 && "$(id -u)" -ne 0 ]]; then
+  echo "lemoncheck --deep needs administrator rights for MDM/firmware/SMART checks."
+  echo "Re-running under sudo (you'll be prompted for your password)..."
+  echo
+  # Preserve args; sudo will re-enter this same code path as root.
+  exec sudo --preserve-env=LEMON_LISTING,NO_COLOR "$0" \
+    --deep \
+    $( [[ "$DO_REPORT" -eq 1 ]] && echo "--report ${REPORT_PATH}" ) \
+    $( [[ -n "$LEMON_LISTING" ]] && printf -- '--listing %q' "$LEMON_LISTING" )
+fi
+
+# --- Run --------------------------------------------------------------------
+clear 2>/dev/null || true
+banner
+
+if [[ "$DEEP" -eq 0 ]]; then
+  printf "  %sRunning standard scan. For MDM, firmware & full SSD checks: %slemoncheck --deep%s\n" \
+    "$C_DIM" "$C_BOLD" "$C_RESET"
+fi
+[[ "$HAS_JQ" -eq 0 ]] && printf "  %s(install 'jq' for more precise parsing)%s\n" "$C_DIM" "$C_RESET"
+
+run_tier1
+run_tier2
+run_tier3
+run_tier4
+run_manual_checklist
+print_summary
+
+# --- HTML report ------------------------------------------------------------
+if [[ "$DO_REPORT" -eq 1 ]]; then
+  if [[ -z "$REPORT_PATH" ]]; then
+    REPORT_PATH="$HOME/Desktop/lemoncheck-report-$(date +%Y%m%d-%H%M%S).html"
+  fi
+  write_html_report "$REPORT_PATH"
+  # If we're root (via --deep), hand ownership back to the invoking user.
+  if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+    chown "$SUDO_USER" "$REPORT_PATH" 2>/dev/null || true
+  fi
+  printf "  %s✔%s HTML report written to %s%s%s\n\n" \
+    "$C_GREEN" "$C_RESET" "$C_BOLD" "$REPORT_PATH" "$C_RESET"
+fi
+
+# Exit non-zero if any deal-breaker was found (useful for scripting).
+for s in "${FND_STATUS[@]}"; do [[ "$s" == "RED" ]] && exit 1; done
+exit 0

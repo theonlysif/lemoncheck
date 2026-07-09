@@ -15,8 +15,9 @@
 #
 set -uo pipefail
 
-LEMONCHECK_VERSION="0.1.1"
+LEMONCHECK_VERSION="0.2.0"
 
+# >>> BUNDLE:STRIP_START — build/bundle.sh replaces this block with inlined libs
 # --- Resolve install dir (symlink-safe) so we can source lib/ ---------------
 _src="${BASH_SOURCE[0]}"
 while [[ -h "$_src" ]]; do
@@ -35,6 +36,7 @@ for m in util tier1_dealbreakers tier2_wear tier3_components tier4_extras report
   f="$LIB_DIR/$m.sh"
   if [[ -f "$f" ]]; then source "$f"; else echo "lemoncheck: missing module $f" >&2; exit 1; fi
 done
+# >>> BUNDLE:STRIP_END
 
 usage() {
   sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'

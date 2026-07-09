@@ -6,3 +6,8 @@ lemoncheck-report-*.html
 *.log
 /tmp/
 scratchpad/
+
+# Build artifacts: keep the single-file script (curl one-liner needs it in the
+# repo), but the .app/.dmg are large binaries — ship them as release assets.
+dist/*.app/
+dist/*.dmg

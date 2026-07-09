@@ -82,14 +82,43 @@ Enclave paths) is baked in from day one.
 
 ## Install
 
-### Homebrew (recommended)
+Pick the path that fits you. Shopping for a used Mac and not a developer? Use
+the first one.
+
+### 🛒 Fastest — one paste, no install (great while shopping)
+
+Open **Terminal** on the Mac you're inspecting (⌘-Space, type "Terminal") and
+paste:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/theonlysif/lemoncheck/main/dist/lemoncheck | bash -s -- --deep --report
+```
+
+Runs in a few seconds, needs no install, and doesn't trip Gatekeeper. Drop
+`--deep` if you don't have the admin password. The `| bash` form is convenient;
+if you'd rather read it first, open the [`dist/lemoncheck`](dist/lemoncheck)
+file — it's the whole program in one file.
+
+### 🍋 Double-click app (for non-developers)
+
+1. Download **LemonCheck.dmg** from the
+   [latest release](https://github.com/theonlysif/lemoncheck/releases/latest).
+2. Open the DMG, drag **LemonCheck** to Applications (or run it right from the DMG).
+3. **First run:** right-click the app ▸ **Open** ▸ **Open** (this one-time step
+   gets past macOS's "unidentified developer" block — the app is free and
+   unsigned). A `READ ME FIRST.txt` in the DMG spells this out.
+
+The app opens Terminal, runs the full scan, and saves an HTML report to your
+Desktop.
+
+### 🍺 Homebrew (for developers)
 
 ```sh
 brew tap theonlysif/lemoncheck https://github.com/theonlysif/lemoncheck
 brew install lemoncheck
 ```
 
-### One-liner
+### From source
 
 ```sh
 git clone https://github.com/theonlysif/lemoncheck.git
@@ -98,6 +127,11 @@ cd lemoncheck && ./install.sh
 
 For the full SSD SMART read, install smartmontools: `brew install smartmontools`.
 For more precise parsing, install `jq`: `brew install jq`.
+
+> **Why no signed, notarized app?** Apple charges $99/yr for a Developer ID and
+> requires notarizing every build. Until that's set up, the app is unsigned —
+> hence the one-time right-click ▸ Open. The `curl` one-liner sidesteps
+> Gatekeeper entirely, which is why it's the recommended path for shopping.
 
 ## Usage
 
